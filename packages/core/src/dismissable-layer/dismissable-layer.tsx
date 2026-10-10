@@ -169,6 +169,21 @@ export function DismissableLayer<T extends ValidComponent = "div">(
 		shouldExcludeElement,
 		onPointerDownOutside,
 		onFocusOutside,
+		captureTouchOutside: () => {
+			const generation = layerStack.getGeneration();
+			const isEligible = () =>
+				!!ref() &&
+				!layerStack.isBelowPointerBlockingLayer(ref()!) &&
+				(!!props.bypassTopMostLayerCheck || layerStack.isTopMostLayer(ref()!));
+
+			const eligibleAtPointerDown = isEligible();
+			return () =>
+				eligibleAtPointerDown &&
+				generation === layerStack.getGeneration() &&
+				isEligible();
+		},
+	} as Parameters<typeof interactOutside>[0] & {
+		captureTouchOutside: () => (() => boolean) | undefined;
 	});
 	createShortcut(
 		["Escape"],
