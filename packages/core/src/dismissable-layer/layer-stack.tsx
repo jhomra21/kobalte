@@ -26,6 +26,11 @@ let originalBodyPointerEvents: string;
 let hasDisabledBodyPointerEvents = false;
 
 const layers: Array<LayerModel> = [];
+let generation = 0;
+
+function getGeneration() {
+	return generation;
+}
 
 function indexOf(node: HTMLElement | undefined) {
 	return layers.findIndex((layer) => layer.node === node);
@@ -58,6 +63,7 @@ function isBelowPointerBlockingLayer(node: HTMLElement) {
 
 function addLayer(layer: LayerModel) {
 	layers.push(layer);
+	generation++;
 }
 
 function removeLayer(node: HTMLElement) {
@@ -68,6 +74,7 @@ function removeLayer(node: HTMLElement) {
 	}
 
 	layers.splice(index, 1);
+	generation++;
 }
 
 function assignPointerEventToLayers() {
@@ -114,6 +121,7 @@ function restoreBodyPointerEvents(node: HTMLElement) {
 
 export const layerStack = {
 	layers,
+	getGeneration,
 	isTopMostLayer,
 	hasPointerBlockingLayer,
 	isBelowPointerBlockingLayer,
