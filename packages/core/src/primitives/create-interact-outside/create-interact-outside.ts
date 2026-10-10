@@ -18,7 +18,6 @@ import {
 	composeEventHandlers,
 	getDocument,
 	isCtrlKey,
-	noop,
 } from "@kobalte/utils";
 import { type Accessor, createEffect, onCleanup } from "solid-js";
 import { isServer } from "solid-js/web";
@@ -63,6 +62,9 @@ export interface CreateInteractOutsideProps {
 	 * Can be prevented.
 	 */
 	onInteractOutside?: (event: InteractOutsideEvent) => void;
+
+	/** Capture whether a touch is eligible and return a guard for its completion. */
+	captureTouchOutside?: () => (() => boolean) | undefined;
 }
 
 const POINTER_DOWN_OUTSIDE_EVENT = "interactOutside.pointerDownOutside";
@@ -73,7 +75,7 @@ export function createInteractOutside<T extends Element>(
 	ref: Accessor<T | undefined>,
 ) {
 	let pointerDownTimeoutId: number | undefined;
-	let clickHandler = noop;
+	let touchCleanup: VoidFunction | undefined;
 
 	const ownerDocument = () => getDocument(ref());
 	const onPointerDownOutside = (e: PointerDownOutsideEvent) =>
@@ -81,14 +83,77 @@ export function createInteractOutside<T extends Element>(
 	const onFocusOutside = (e: FocusOutsideEvent) => props.onFocusOutside?.(e);
 	const onInteractOutside = (e: InteractOutsideEvent) =>
 		props.onInteractOutside?.(e);
+	const onLateTouchClick = (event: Event) => {
+		const click = event as MouseEvent;
+		if (!click.detail) {
+			return;
+		}
+		const target = getEventTarget(click);
+		const hit = ownerDocument().elementFromPoint?.(
+			click.clientX,
+			click.clientY,
+		);
+		const ElementConstructor = ownerDocument().defaultView?.Element;
+		if (
+			!target ||
+			!hit ||
+			!ElementConstructor ||
+			!(target instanceof ElementConstructor)
+		) {
+			return;
+		}
+		const original = lateTouchOriginalTarget;
+		if (original?.contains(hit) || lateTouchCompletionTarget?.contains(hit)) {
+			removeLateTouchClickProtection();
+			return;
+		}
+		if (
+			Math.hypot(click.clientX - lateTouchX, click.clientY - lateTouchY) > 10
+		) {
+			removeLateTouchClickProtection();
+			return;
+		}
+		if (target.contains(hit)) {
+			event.preventDefault();
+			event.stopImmediatePropagation();
+		}
+		removeLateTouchClickProtection();
+	};
+	let lateTouchOriginalTarget: Element | undefined;
+	let lateTouchCompletionTarget: Element | undefined;
+	let lateTouchX = 0;
+	let lateTouchY = 0;
+	let lateTouchClickTimeout: number | undefined;
+	const removeLateTouchClickProtection = () => {
+		const doc = ownerDocument();
+		doc.removeEventListener("click", onLateTouchClick, true);
+		doc.removeEventListener(
+			"pointerdown",
+			removeLateTouchClickProtection,
+			true,
+		);
+		if (lateTouchClickTimeout !== undefined) {
+			window.clearTimeout(lateTouchClickTimeout);
+			lateTouchClickTimeout = undefined;
+		}
+		lateTouchOriginalTarget = undefined;
+		lateTouchCompletionTarget = undefined;
+		lateTouchX = 0;
+		lateTouchY = 0;
+	};
 
-	const isEventOutside = (e: Event) => {
+	const isEventOutside = (e: Event | { target: EventTarget | null }) => {
 		// The element the interaction started on, not `e.target` — these listeners
 		// are on the document, so an interaction inside a shadow tree reports that
 		// tree's host instead. The distinction decides this function: a layer
 		// rendered inside a shadow root sees each of its own clicks as the host,
 		// which is outside itself, and dismisses on pointerdown.
-		const target = getEventTarget(e);
+		const target =
+			"composedPath" in e && typeof e.composedPath === "function"
+				? getEventTarget(e as Event)
+				: e.target instanceof Element
+					? e.target
+					: null;
 
 		if (!target) {
 			return false;
@@ -111,12 +176,13 @@ export function createInteractOutside<T extends Element>(
 	};
 
 	const onPointerDown = (e: PointerEvent) => {
-		function handler() {
+		removeLateTouchClickProtection();
+		const handler = () => {
 			const container = ref();
 			const target = getEventTarget(e);
 
 			if (!container || !target || !isEventOutside(e)) {
-				return;
+				return false;
 			}
 
 			const handler = composeEventHandlers([
@@ -141,27 +207,270 @@ export function createInteractOutside<T extends Element>(
 			);
 
 			target.dispatchEvent(pointerDownOutsideEvent);
+			return !pointerDownOutsideEvent.defaultPrevented;
+		};
+
+		// Mouse interactions are immediate. Touch interactions are dispatched
+		// after their native completion events settle, including when no click is
+		// generated.
+		if (e.pointerType !== "touch") {
+			touchCleanup?.();
+			touchCleanup = undefined;
+			handler();
+			return;
 		}
 
-		/**
-		 * On touch devices, we need to wait for a click event because browsers implement
-		 * a ~350ms delay between the time the user stops touching the display and when the
-		 * browser executes events. We need to ensure we don't reactivate pointer-events within
-		 * this timeframe otherwise the browser may execute events that should have been prevented.
-		 *
-		 * Additionally, this also lets us deal automatically with cancellations when a click event
-		 * isn't raised because the page was considered scrolled/drag-scrolled, long-pressed, etc.
-		 *
-		 * This is why we also continuously remove the previous listener, because we cannot be
-		 * certain that it was raised, and therefore cleaned-up.
-		 */
-		if (e.pointerType === "touch") {
-			ownerDocument().removeEventListener("click", handler);
-			clickHandler = handler;
-			ownerDocument().addEventListener("click", handler, { once: true });
-		} else {
-			handler();
+		touchCleanup?.();
+		touchCleanup = undefined;
+		const doc = ownerDocument();
+		if (!e.isPrimary) {
+			return;
 		}
+		const startedAt = performance.now();
+		const eligible = props.captureTouchOutside?.() ?? (() => true);
+		let upEvent: PointerEvent | undefined;
+		let touchStartEvent: TouchEvent | undefined;
+		let touchEndEvent: TouchEvent | undefined;
+		let compatibilityClick: MouseEvent | undefined;
+		let touchId: number | undefined;
+		let completionTimer: number | undefined;
+		let watchdogTimer: number | undefined;
+		let upTarget: EventTarget | null = null;
+		const clean = () => {
+			doc.removeEventListener("pointerup", onPointerUp, true);
+			doc.removeEventListener("pointercancel", onPointerCancel, true);
+			doc.removeEventListener("touchstart", onTouchStart, true);
+			doc.removeEventListener("touchmove", onTouchMove, true);
+			doc.removeEventListener("touchend", onTouchEnd, true);
+			doc.removeEventListener("touchcancel", onCancel, true);
+			doc.removeEventListener("scroll", onCancel, true);
+			doc.removeEventListener("pointermove", onPointerMove, true);
+			doc.removeEventListener("click", onClick, true);
+			if (completionTimer !== undefined) {
+				window.clearTimeout(completionTimer);
+			}
+			if (watchdogTimer !== undefined) {
+				window.clearTimeout(watchdogTimer);
+			}
+			if (touchCleanup === clean) {
+				touchCleanup = undefined;
+			}
+		};
+		const onCancel = () => clean();
+		const onPointerCancel = (event: Event) => {
+			if ((event as PointerEvent).pointerId === e.pointerId) {
+				clean();
+			}
+		};
+		const moved = (event: Pick<PointerEvent, "clientX" | "clientY">) =>
+			Math.hypot(event.clientX - e.clientX, event.clientY - e.clientY) > 10;
+		const onPointerMove = (event: Event) => {
+			const pointer = event as PointerEvent;
+			if (pointer.pointerId === e.pointerId && moved(pointer)) {
+				clean();
+			}
+		};
+		const onPointerUp = (event: Event) => {
+			const pointer = event as PointerEvent;
+			if (pointer.pointerId !== e.pointerId) {
+				return;
+			}
+			if (moved(pointer) || performance.now() - startedAt >= 500) {
+				clean();
+				return;
+			}
+			upEvent = pointer;
+			upTarget =
+				doc.elementFromPoint?.(pointer.clientX, pointer.clientY) ??
+				getEventTarget(pointer);
+			if (watchdogTimer !== undefined) {
+				window.clearTimeout(watchdogTimer);
+				watchdogTimer = undefined;
+			}
+			if (!touchStartEvent) {
+				completionTimer = window.setTimeout(finish, 400);
+			} else {
+				watchdogTimer = window.setTimeout(clean, 400);
+			}
+		};
+		const onTouchStart = (event: Event) => {
+			const touch = event as TouchEvent;
+			const point = touch.changedTouches[0];
+			const target = getEventTarget(e);
+			if (
+				touchStartEvent ||
+				touch.touches.length !== 1 ||
+				!point ||
+				point.target !== target
+			) {
+				clean();
+				return;
+			}
+			if (completionTimer !== undefined) {
+				window.clearTimeout(completionTimer);
+				completionTimer = undefined;
+			}
+			touchStartEvent = touch;
+			touchId = point.identifier;
+		};
+		const onTouchMove = (event: Event) => {
+			const touch = event as TouchEvent;
+			const point = [...touch.touches].find(
+				(item) => item.identifier === touchId,
+			);
+			if (touch.touches.length !== 1 || !point || moved(point)) {
+				clean();
+			}
+		};
+		const finish = () => {
+			const currentHit =
+				upEvent &&
+				(doc.elementFromPoint?.(upEvent.clientX, upEvent.clientY) ??
+					getEventTarget(upEvent));
+			if (
+				!upEvent ||
+				!eligible() ||
+				e.defaultPrevented ||
+				upEvent.defaultPrevented ||
+				touchStartEvent?.defaultPrevented ||
+				touchEndEvent?.defaultPrevented ||
+				compatibilityClick?.defaultPrevented ||
+				!upTarget ||
+				!isEventOutside(e) ||
+				!isEventOutside({ target: upTarget }) ||
+				!currentHit ||
+				!isEventOutside({ target: currentHit })
+			) {
+				clean();
+				return;
+			}
+			const ElementConstructor = doc.defaultView?.Element;
+			const downTarget = getEventTarget(e);
+			const original =
+				ElementConstructor && downTarget instanceof ElementConstructor
+					? downTarget.closest(
+							"button, a[href], input, select, textarea, label",
+						) ?? downTarget
+					: undefined;
+			clean();
+			const accepted = handler();
+			if (
+				accepted !== false &&
+				ElementConstructor &&
+				original instanceof ElementConstructor &&
+				upTarget instanceof ElementConstructor
+			) {
+				lateTouchOriginalTarget = original;
+				lateTouchCompletionTarget = upTarget;
+				lateTouchX = upEvent.clientX;
+				lateTouchY = upEvent.clientY;
+				doc.addEventListener("click", onLateTouchClick, true);
+				doc.addEventListener(
+					"pointerdown",
+					removeLateTouchClickProtection,
+					true,
+				);
+				lateTouchClickTimeout = window.setTimeout(
+					removeLateTouchClickProtection,
+					400,
+				);
+			}
+		};
+		const onTouchEnd = (event: Event) => {
+			touchEndEvent = event as TouchEvent;
+			const point = [...touchEndEvent.changedTouches].find(
+				(item) => item.identifier === touchId,
+			);
+			if (
+				touchEndEvent.defaultPrevented ||
+				(touchStartEvent && !point) ||
+				touchEndEvent.touches.length > 0 ||
+				(point ? moved(point) : false)
+			) {
+				clean();
+				return;
+			}
+			if (!upEvent) {
+				return;
+			}
+			if (watchdogTimer !== undefined) {
+				window.clearTimeout(watchdogTimer);
+				watchdogTimer = undefined;
+			}
+			completionTimer = window.setTimeout(finish, compatibilityClick ? 0 : 400);
+		};
+		const onClick = (event: Event) => {
+			const click = event as MouseEvent;
+			const target = getEventTarget(click);
+			const downTarget = getEventTarget(e);
+			const ElementConstructor = doc.defaultView?.Element;
+			const currentHit =
+				upEvent &&
+				(doc.elementFromPoint?.(upEvent.clientX, upEvent.clientY) ??
+					getEventTarget(upEvent));
+			if (
+				!click.detail ||
+				!upEvent ||
+				!ElementConstructor ||
+				!(target instanceof ElementConstructor) ||
+				!(downTarget instanceof ElementConstructor) ||
+				!upTarget ||
+				!(upTarget instanceof ElementConstructor) ||
+				!currentHit ||
+				!(currentHit instanceof ElementConstructor) ||
+				!isEventOutside(click)
+			) {
+				return;
+			}
+			const original =
+				downTarget.closest("button, a[href], input, select, textarea, label") ??
+				downTarget;
+			const commonAncestor = (() => {
+				for (
+					let ancestor: Element | null = downTarget;
+					ancestor;
+					ancestor = ancestor.parentElement
+				) {
+					if (
+						ancestor !== doc.body &&
+						ancestor !== doc.documentElement &&
+						ancestor.contains(upTarget) &&
+						ancestor.contains(target)
+					) {
+						return ancestor;
+					}
+				}
+				return null;
+			})();
+			if (
+				(!original.contains(target) && !commonAncestor) ||
+				(!target.contains(currentHit) && !currentHit.contains(target))
+			) {
+				return;
+			}
+			compatibilityClick = click;
+			if (touchEndEvent) {
+				if (completionTimer !== undefined) {
+					window.clearTimeout(completionTimer);
+				}
+				completionTimer = window.setTimeout(finish, 0);
+			}
+		};
+		doc.addEventListener("pointerup", onPointerUp, true);
+		doc.addEventListener("pointercancel", onPointerCancel, true);
+		doc.addEventListener("touchstart", onTouchStart, true);
+		doc.addEventListener("touchmove", onTouchMove, true);
+		doc.addEventListener("touchend", onTouchEnd, true);
+		doc.addEventListener("touchcancel", onCancel, true);
+		doc.addEventListener("scroll", onCancel, true);
+		doc.addEventListener("pointermove", onPointerMove, true);
+		doc.addEventListener("click", onClick, true);
+		watchdogTimer = window.setTimeout(() => {
+			if (!upEvent) {
+				clean();
+			}
+		}, 500);
+		touchCleanup = clean;
 	};
 
 	const onFocusIn = (e: FocusEvent) => {
@@ -221,7 +530,9 @@ export function createInteractOutside<T extends Element>(
 		onCleanup(() => {
 			window.clearTimeout(pointerDownTimeoutId);
 
-			ownerDocument().removeEventListener("click", clickHandler);
+			touchCleanup?.();
+			touchCleanup = undefined;
+			removeLateTouchClickProtection();
 			ownerDocument().removeEventListener("pointerdown", onPointerDown, true);
 			ownerDocument().removeEventListener("focusin", onFocusIn, true);
 		});
